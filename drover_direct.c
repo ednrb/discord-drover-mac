@@ -16,6 +16,7 @@
 
 #include <crt_externs.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -71,9 +72,12 @@ static socket_fn real_socket;
 static int udp_log_remaining = 48;
 
 static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static uint8_t injected_fds[FD_TABLE_SIZE];
+/* Per-fd state, read on every send. Lock-free so the hot path is one load.
+ * FD_FRESH: not classified yet. FD_DONE: prelude sent, or the fd can never
+ * be a voice socket. drover_socket() resets an fd to FD_FRESH on reuse. */
+enum { FD_FRESH = 0, FD_DONE = 1 };
+static uint8_t fd_state[FD_TABLE_SIZE];
 static char dylib_path[4096];
 static char packet_path[4096];
 static bool debug_enabled;
@@ -81,7 +85,6 @@ static bool verbose_udp;
 static bool hooks_active;
 static bool renderer_hooks;
 static FILE *log_file;
-static volatile int injecting;
 
 static void drover_log(const char *fmt, ...) {
     va_list args;
@@ -306,57 +309,57 @@ static void reset_injected_fd(int fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) {
         return;
     }
-    pthread_mutex_lock(&state_lock);
-    injected_fds[fd] = 0;
-    pthread_mutex_unlock(&state_lock);
+    __atomic_store_n(&fd_state[fd], FD_FRESH, __ATOMIC_RELEASE);
 }
 
-static bool is_udp_socket(int fd) {
+/* 1 = IPv4/IPv6 UDP socket, 0 = definitely not, -1 = could not tell. */
+static int classify_inet_udp(int fd) {
     int type = 0;
     socklen_t length = sizeof(type);
 
     if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0) {
-        return false;
+        return errno == ENOTSOCK ? 0 : -1;
     }
-    return type == SOCK_DGRAM;
-}
+    if (type != SOCK_DGRAM) {
+        return 0;
+    }
 
-static bool is_inet_udp_socket(int fd) {
     struct sockaddr_storage local;
     socklen_t local_length = sizeof(local);
-
-    if (!is_udp_socket(fd)) {
-        return false;
-    }
     memset(&local, 0, sizeof(local));
     if (getsockname(fd, (struct sockaddr *)&local, &local_length) != 0) {
-        return false;
+        return -1;
     }
-    return local.ss_family == AF_INET || local.ss_family == AF_INET6;
+    return (local.ss_family == AF_INET || local.ss_family == AF_INET6) ? 1 : 0;
 }
 
 static bool consume_voice_handshake(int fd, size_t length) {
-    if (!hooks_active || fd < 0 || fd >= FD_TABLE_SIZE || length == 0) {
+    if (fd < 0 || fd >= FD_TABLE_SIZE || length == 0) {
         return false;
     }
-    if (!is_inet_udp_socket(fd)) {
+    /* Hot path: after the first send on a socket this is the only check. */
+    if (__atomic_load_n(&fd_state[fd], __ATOMIC_ACQUIRE) == FD_DONE) {
         return false;
     }
     /* Main process also sees DNS/QUIC; only the classic 74-byte discovery
-     * packet is safe there. The renderer owns discord_voice.node, so the
-     * first IP UDP datagram on a socket is the voice handshake. */
+     * packet is safe there. Checked before any syscall. The renderer owns
+     * discord_voice.node, so there the first IP UDP datagram is the voice
+     * handshake. */
     if (!renderer_hooks && length != FIRST_UDP_LEN) {
         return false;
     }
 
-    bool first = false;
-    pthread_mutex_lock(&state_lock);
-    if (!injected_fds[fd]) {
-        injected_fds[fd] = 1;
-        first = true;
+    int kind = classify_inet_udp(fd);
+    if (kind < 0) {
+        return false; /* transient; try again on the next send */
     }
-    pthread_mutex_unlock(&state_lock);
-    return first;
+
+    uint8_t expected = FD_FRESH;
+    bool claimed = __atomic_compare_exchange_n(
+        &fd_state[fd], &expected, FD_DONE, false,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+    );
+    return claimed && kind == 1;
 }
 
 static ssize_t call_out(
@@ -385,7 +388,6 @@ static void send_prelude(
     socklen_t destination_length
 ) {
     locate_paths();
-    injecting = 1;
 
     if (packet_path[0] != '\0' && path_is_file(packet_path)) {
         size_t packet_length = 0;
@@ -403,7 +405,6 @@ static void send_prelude(
     unsigned char one = 1;
     call_out(fd, &zero, sizeof(zero), 0, destination, destination_length);
     call_out(fd, &one, sizeof(one), 0, destination, destination_length);
-    injecting = 0;
     usleep(PRELUDE_SLEEP_US);
 }
 
@@ -413,16 +414,15 @@ static void maybe_inject(
     const struct sockaddr *destination,
     socklen_t destination_length
 ) {
-    if (!hooks_active || injecting) {
+    /* The prelude goes out through raw syscalls (call_out), never through
+     * these hooks, so no re-entry guard is needed. */
+    if (!hooks_active) {
         return;
     }
 
-    bool udp = is_udp_socket(fd);
-    if (udp) {
-        drover_log("[drover] udp send fd=%d len=%zu", fd, length);
-    } else if (udp_log_remaining > 0) {
+    if (verbose_udp && udp_log_remaining > 0) {
         udp_log_remaining--;
-        drover_log("[drover] send fd=%d len=%zu udp=0", fd, length);
+        drover_log("[drover] send fd=%d len=%zu", fd, length);
     }
 
     if (!consume_voice_handshake(fd, length)) {
@@ -586,7 +586,7 @@ static void rebind_image(const struct mach_header *header, intptr_t slide) {
                         continue;
                     }
                     bindings[p] = replacement_for_symbol(name);
-                    if (image_info.dli_fname != NULL) {
+                    if (debug_enabled && image_info.dli_fname != NULL) {
                         drover_log("[drover] rebound %s in %s", name, image_info.dli_fname);
                     }
                 }
@@ -689,7 +689,7 @@ static int drover_socket(int domain, int type, int protocol) {
     if (fd >= 0) {
         reset_injected_fd(fd);
     }
-    if (hooks_active && fd >= 0 && (type & 0xff) == SOCK_DGRAM) {
+    if (debug_enabled && hooks_active && fd >= 0 && (type & 0xff) == SOCK_DGRAM) {
         drover_log("[drover] socket dgram fd=%d domain=%d proto=%d", fd, domain, protocol);
     }
     return fd;

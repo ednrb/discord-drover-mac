@@ -61,7 +61,11 @@ Use this Dock icon for voice, not the original Discord.
 
 Join a voice channel in **Discord Drover**. Each new channel connection sends the prelude again (including when macOS recycles socket file descriptors).
 
-Logs: `/tmp/discord-drover.log`
+Logs: `/tmp/discord-drover.log`. By default this only records startup and one line per new voice connection. For troubleshooting, launch with `DROVER_DEBUG=1` (adds socket and hook details) or `DROVER_DEBUG=2` (also logs the first 48 sends):
+
+```bash
+DROVER_DEBUG=2 ./run-discord.sh
+```
 
 ## Updating
 
